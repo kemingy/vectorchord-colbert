@@ -1,3 +1,5 @@
+# Copied from BEIR, licensed under Apache-2.0
+
 from typing import Dict, Tuple
 from tqdm.autonotebook import tqdm
 import json
