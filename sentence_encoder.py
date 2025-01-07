@@ -32,4 +32,3 @@ if __name__ == "__main__":
     print(doc_emb.shape, query_emb.shape)
     doc_emb.dump("doc_sentence_emb.np")
     query_emb.dump("query_sentence_emb.np")
-

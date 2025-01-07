@@ -90,9 +90,25 @@ class PgClient:
         self.dataset = dataset
         self.num = num
         self.conn = psycopg.connect(url, autocommit=True)
-        with self.conn.cursor() as cursor:
-            cursor.execute("CREATE EXTENSION IF NOT EXISTS vchord CASCADE;")
+        self.conn.execute("CREATE EXTENSION IF NOT EXISTS vchord CASCADE;")
         register_vector(self.conn)
+        self.conn.execute("""
+            CREATE OR REPLACE FUNCTION max_sim(document vector[], query vector[]) RETURNS double precision AS $$
+            WITH queries AS (
+                SELECT row_number() OVER () AS query_number, * FROM (SELECT unnest(query) AS query)
+            ),
+            documents AS (
+                SELECT unnest(document) AS document
+            ),
+            similarities AS (
+                SELECT query_number, document <=> query AS similarity FROM queries CROSS JOIN documents
+            ),
+            max_similarities AS (
+                SELECT MAX(similarity) AS max_similarity FROM similarities GROUP BY query_number
+            )
+            SELECT SUM(max_similarity) FROM max_similarities
+            $$ LANGUAGE SQL
+        """)
         self.token_encoder = TokenEmbedding()
         self.sentence_encoder = SentenceEmbedding()
 
@@ -128,12 +144,18 @@ class PgClient:
             for did, doc in tqdm(zip(doc_ids, docs), desc="insert corpus"):
                 emb = self.sentence_encoder.encode_doc(doc)
                 embs = self.token_encoder.encode_doc(doc)
-                cursor.execute(f"INSERT INTO {self.dataset}_corpus (id, text, emb, embs) VALUES (%s, %s, %s, %s)", (did, doc, emb, [e for e in embs]))
+                cursor.execute(
+                    f"INSERT INTO {self.dataset}_corpus (id, text, emb, embs) VALUES (%s, %s, %s, %s)",
+                    (did, doc, emb, [e for e in embs]),
+                )
 
             for qid, query in tqdm(zip(qids, queries), desc="insert query"):
                 emb = self.sentence_encoder.encode_query(query)
                 embs = self.token_encoder.encode_query(query)
-                cursor.execute(f"INSERT INTO {self.dataset}_query (id, text, emb, embs) VALUES (%s, %s, %s, %s)", (qid, query, emb, [e for e in embs]))
+                cursor.execute(
+                    f"INSERT INTO {self.dataset}_query (id, text, emb, embs) VALUES (%s, %s, %s, %s)",
+                    (qid, query, emb, [e for e in embs]),
+                )
 
             # with cursor.copy(
             #     f"COPY {self.dataset}_query (id, text, emb, embs)"
@@ -154,7 +176,7 @@ class PgClient:
 
     def index(self, workers: int):
         start_time = perf_counter()
-        centroids = min(4 * int(self.num ** 0.5), self.num // 40)
+        centroids = min(4 * int(self.num**0.5), self.num // 40)
         ivf_config = f"""
         residual_quantization = true
         [build.internal]
@@ -165,12 +187,13 @@ class PgClient:
         with self.conn.cursor() as cursor:
             cursor.execute(f"SET max_parallel_maintenance_workers TO {workers}")
             cursor.execute(f"SET max_parallel_workers TO {workers}")
-            cursor.execute(f"CREATE INDEX {self.dataset}_rabitq ON {self.dataset}_corpus USING vchordrq (emb vector_l2_ops) WITH (options = $${ivf_config}$$)")
+            cursor.execute(
+                f"CREATE INDEX {self.dataset}_rabitq ON {self.dataset}_corpus USING vchordrq (emb vector_l2_ops) WITH (options = $${ivf_config}$$)"
+            )
 
         logger.info("build index takes %f seconds", perf_counter() - start_time)
 
-
-    def query(self, topk):
+    def query(self, topk: int):
         start_time = perf_counter()
         with self.conn.cursor() as cursor:
             cursor.execute(
@@ -180,6 +203,16 @@ class PgClient:
             )
             res = cursor.fetchall()
         logger.info("query takes %f seconds", perf_counter() - start_time)
+        return res
+
+    def rerank(self, query: str, ids: list[int], topk: int):
+        token_embs = [emb for emb in self.token_encoder.encode_query(query)]
+        with self.conn.cursor() as cursor:
+            cursor.execute(
+                f"SELECT id, text FROM {self.dataset}_corpus WHERE id = ANY(%s) "
+                f"ORDER BY max_sim(embs, %s) DESC LIMIT {topk}"(ids, token_embs)
+            )
+            res = cursor.fetchall()
         return res
 
 
@@ -203,7 +236,9 @@ def main(dataset, topk, save_dir):
 
     logger.info("Corpus: %d, query: %d", num_doc, len(qids))
 
-    client = PgClient("postgresql://postgres:postgres@172.17.0.1:5432/", dataset, num_doc)
+    client = PgClient(
+        "postgresql://postgres:postgres@172.17.0.1:5432/", dataset, num_doc
+    )
     client.create()
     client.insert(corpus_ids, corpus_text, qids, query_text)
     client.index(int(len(os.sched_getaffinity(0)) * 0.8))
