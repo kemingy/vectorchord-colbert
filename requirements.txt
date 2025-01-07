@@ -1,0 +1,9 @@
+tqdm
+psycopg[binary]
+pytrec_eval
+requests
+numpy
+pgvector
+torch --index-url https://download.pytorch.org/whl/cpu
+sentence_transformers
+colbert-ai
