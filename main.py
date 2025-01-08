@@ -1,7 +1,7 @@
 from loader import GenericDataLoader
 from evaluate import EvaluateRetrieval
-from token_encoder import TokenEmbedding
 from sentence_encoder import SentenceEmbedding
+from token_encoder import TokenEmbedding
 
 import argparse
 import os
@@ -114,8 +114,6 @@ class PgClient:
 
     def create(self):
         with self.conn.cursor() as cursor:
-            # cursor.execute(f"DROP TABLE IF EXISTS {self.dataset}_corpus;")
-            # cursor.execute(f"DROP TABLE IF EXISTS {self.dataset}_query;")
             cursor.execute(
                 f"CREATE TABLE IF NOT EXISTS {self.dataset}_corpus (id TEXT, text TEXT, emb vector(1536), embs vector(128)[]);"
             )
@@ -198,22 +196,29 @@ class PgClient:
         with self.conn.cursor() as cursor:
             cursor.execute(
                 f"select q.id as qid, c.id, c.score from {self.dataset}_query q, lateral ("
-                f"select id, corpus.emb <-> q.emb as score from {self.dataset}_corpus order by score"
-                f" limit {topk}) c;"
+                f"select id, {self.dataset}_corpus.emb <-> q.emb as score from "
+                f"{self.dataset}_corpus order by score limit {topk}) c;"
             )
             res = cursor.fetchall()
         logger.info("query takes %f seconds", perf_counter() - start_time)
         return res
 
-    def rerank(self, query: str, ids: list[int], topk: int):
-        token_embs = [emb for emb in self.token_encoder.encode_query(query)]
+    def rerank(self, results: dict, topk: int):
+        start_time = perf_counter()
+        ans = {}
         with self.conn.cursor() as cursor:
-            cursor.execute(
-                f"SELECT id, text FROM {self.dataset}_corpus WHERE id = ANY(%s) "
-                f"ORDER BY max_sim(embs, %s) DESC LIMIT {topk}"(ids, token_embs)
-            )
-            res = cursor.fetchall()
-        return res
+            for qid, recalls in results.items():
+                cursor.execute(
+                    "SELECT c.id, max_sim(c.embs, "
+                    f"(SELECT q.embs from {self.dataset}_query q WHERE q.id = %s)"
+                    f") AS score FROM {self.dataset}_corpus c WHERE id = ANY(%s) "
+                    f"ORDER BY score DESC LIMIT {topk}",
+                    (qid, list(recalls.keys())),
+                )
+                ans[qid] = dict(cursor.fetchall())
+
+        logger.info("rerank takes %f seconds", perf_counter() - start_time)
+        return ans
 
 
 def main(dataset, topk, save_dir):
@@ -242,7 +247,7 @@ def main(dataset, topk, save_dir):
     client.create()
     client.insert(corpus_ids, corpus_text, qids, query_text)
     client.index(int(len(os.sched_getaffinity(0)) * 0.8))
-    results = client.query()
+    results = client.query(topk)
 
     format_results = {}
     for qid, cid, score in results:
@@ -251,6 +256,9 @@ def main(dataset, topk, save_dir):
             format_results[key] = {}
         format_results[key][str(cid)] = float(score)
 
+    format_results = client.rerank(format_results, topk)
+
+    os.makedirs("results", exist_ok=True)
     with open(f"results/vectorchord_{dataset}.json", "w") as f:
         json.dump(format_results, f, indent=2)
 

@@ -175,3 +175,7 @@ cython_debug/
 
 # BEIR dataset
 datasets/
+
+# Resutls
+*.json
+results/
