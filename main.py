@@ -192,6 +192,8 @@ class PgClient:
         logger.info("build index takes %f seconds", perf_counter() - start_time)
 
     def query(self, topk: int):
+        probe = int(0.1 * min(4 * int(self.num**0.5), self.num // 40))
+        self.conn.execute(f"SET vchordrq.probes = {probe}")
         start_time = perf_counter()
         with self.conn.cursor() as cursor:
             cursor.execute(
